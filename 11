@@ -1,0 +1,2 @@
+https://github.com/Most166/MOST1/blob/main/.gitignore
+local OrionLib = loadstring(game:HttpGet(('https://github.com/Most166/MOST1/blob/main/.gitignore')))()
