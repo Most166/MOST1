@@ -1,9 +1,157 @@
-local OrionLib = loadstring(game:HttpGet(('https://raw.githubusercontent.com/shlexware/Orion/main/source')))()
-local Window = OrionLib:MakeWindow({Name = "MOST", HidePremium = false, SaveConfig = true, ConfigFolder = "MOST"})
-local Tab = Window:MakeTab({
-	Name = "ESP",
-	Icon = "rbxassetid://4483345998",
-	PremiumOnly = false
-})
-local Section = Tab:AddSection({
-	Name = "ESP"
+local players = game:GetService("Players")
+local localPlayer = players.LocalPlayer
+local espEnabled = true -- ตั้งค่าการเปิด/ปิด ESP
+local maxDistance = 9999999 -- ระยะทางสูงสุดในการเห็น ESP
+
+-- สร้าง GUI ปุ่มกดสำหรับเปิด/ปิด ESP
+local ScreenGui = Instance.new("ScreenGui")
+local button = Instance.new("TextButton")
+
+-- ตั้งค่าปุ่ม
+ScreenGui.Parent = game.CoreGui
+button.Parent = ScreenGui
+button.Size = UDim2.new(0, 100, 0, 40) -- ขนาดปุ่ม (เล็กลง)
+button.Position = UDim2.new(0, 10, 0, 10) -- ตำแหน่งปุ่มบนหน้าจอ
+button.Text = "ESP"
+button.BackgroundColor3 = Color3.new(1, 0, 0)
+
+-- ทำให้ปุ่มสามารถลากได้
+local dragging = false
+local dragInput, mousePos, framePos
+
+button.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        mousePos = input.Position
+        framePos = button.Position
+
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+button.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement then
+        dragInput = input
+    end
+end)
+
+game:GetService("UserInputService").InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta = input.Position - mousePos
+        button.Position = UDim2.new(
+            framePos.X.Scale,
+            framePos.X.Offset + delta.X,
+            framePos.Y.Scale,
+            framePos.Y.Offset + delta.Y
+        )
+    end
+end)
+
+-- ฟังก์ชันสำหรับสร้าง ESP
+local function createESP(player)
+    if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+        -- ตรวจสอบว่าผู้เล่นยังไม่มี Highlight เพื่อป้องกันการสร้างซ้ำ
+        if not player.Character:FindFirstChildOfClass("Highlight") then
+            local highlight = Instance.new("Highlight")
+            highlight.Adornee = player.Character
+            highlight.FillColor = Color3.new(1, 0, 0) -- สีของ ESP (สีแดง)
+            highlight.OutlineColor = Color3.new(0, 0, 0) -- สีขอบของ ESP (สีดำ)
+            highlight.FillTransparency = 0.5 -- ความโปร่งใส
+            highlight.Parent = player.Character
+        end
+    end
+end
+
+-- ฟังก์ชันสำหรับลบ ESP
+local function removeESP(player)
+    if player.Character then
+        local highlight = player.Character:FindFirstChildOfClass("Highlight")
+        if highlight then
+            highlight:Destroy()
+        end
+    end
+end
+
+-- ฟังก์ชันสำหรับตรวจสอบระยะทาง
+local function checkDistance(player)
+    if player.Character and player.Character:FindFirstChild("HumanoidRootPart") and localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        local distance = (localPlayer.Character.HumanoidRootPart.Position - player.Character.HumanoidRootPart.Position).Magnitude
+        if distance <= maxDistance then
+            createESP(player)
+        else
+            removeESP(player)
+        end
+    end
+end
+
+-- ฟังก์ชันสำหรับตรวจสอบการโหลดของตัวละคร
+local function onCharacterAdded(player)
+    if player.Character then
+        -- รอให้ HumanoidRootPart ถูกสร้างและโหลดเสร็จ
+        player.Character:WaitForChild("HumanoidRootPart")
+        checkDistance(player) -- ตรวจสอบระยะทางเพื่อสร้าง ESP
+    end
+end
+
+-- ตรวจสอบผู้เล่นที่เข้าร่วมเกม
+for _, player in pairs(players:GetPlayers()) do
+    if player ~= localPlayer then
+        if player.Character then
+            onCharacterAdded(player) -- ตรวจสอบตัวละครที่มีอยู่แล้ว
+        end
+        -- เชื่อมต่อเมื่อผู้เล่นเพิ่มตัวละครใหม่
+        player.CharacterAdded:Connect(function()
+            onCharacterAdded(player)
+        end)
+    end
+end
+
+-- สร้าง ESP เมื่อผู้เล่นเข้าร่วม
+players.PlayerAdded:Connect(function(player)
+    player.CharacterAdded:Connect(function()
+        onCharacterAdded(player)
+    end)
+end)
+
+-- ลบ ESP เมื่อผู้เล่นออกจากเกม
+players.PlayerRemoving:Connect(function(player)
+    removeESP(player)
+end)
+
+-- ลบ ESP เมื่อผู้เล่นเสียชีวิต
+localPlayer.CharacterAdded:Connect(function(character)
+    removeESP(localPlayer)
+    character:WaitForChild("Humanoid").Died:Connect(function()
+        removeESP(localPlayer)
+    end)
+end)
+
+-- ฟังก์ชันเปิด/ปิด ESP เมื่อกดปุ่ม
+button.MouseButton1Click:Connect(function()
+    espEnabled = not espEnabled
+    button.BackgroundColor3 = espEnabled and Color3.new(0, 1, 0) or Color3.new(1, 0, 0)
+    for _, player in pairs(players:GetPlayers()) do
+        if player ~= localPlayer then
+            if espEnabled then
+                checkDistance(player)
+            else
+                removeESP(player)
+            end
+        end
+    end
+end)
+
+-- ตรวจสอบระยะทางทุกเฟรม
+game:GetService("RunService").RenderStepped:Connect(function()
+    if espEnabled then
+        for _, player in pairs(players:GetPlayers()) do
+            if player ~= localPlayer then
+                checkDistance(player)
+            end
+        end
+    end
+end)
