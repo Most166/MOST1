@@ -5,7 +5,7 @@ local Camera = workspace.CurrentCamera
 
 -- === สร้างเมนู GUI (Hide and Seek by most) ===
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "MostFullVersion_V13"
+ScreenGui.Name = "MostHub"
 ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 ScreenGui.ResetOnSpawn = false
 
@@ -26,7 +26,7 @@ local titleLabel = Instance.new("TextLabel")
 titleLabel.Size = UDim2.new(1, -70, 0, 30)
 titleLabel.Position = UDim2.new(0, 15, 0, 5)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "Hide and Seek by most"
+titleLabel.Text = "FM HUB"
 titleLabel.TextColor3 = Color3.new(1, 1, 1)
 titleLabel.Font = Enum.Font.SourceSansBold
 titleLabel.TextSize = 16
@@ -68,8 +68,8 @@ end
 
 -- ปุ่มเมนู
 local espBtn = createBtn("ESP: OFF", Color3.fromRGB(200, 60, 60))
-local autoCreditBtn = createBtn("Auto Farm Credit: OFF", Color3.fromRGB(200, 60, 60))
-local selectPlayerBtn = createBtn("Select player: None", Color3.fromRGB(60, 60, 60))
+local autoCreditBtn = createBtn("Auto Credit: OFF", Color3.fromRGB(200, 60, 60))
+local selectPlayerBtn = createBtn("Select player: -", Color3.fromRGB(60, 60, 60))
 local followBtn = createBtn("Follow Player: OFF", Color3.fromRGB(200, 60, 60))
 local tpPlayerBtn = createBtn("TP to Player", Color3.fromRGB(100, 50, 180))
 local tpPosBtn = createBtn("Win 100%", Color3.fromRGB(180, 140, 20))
@@ -102,7 +102,7 @@ end)
 
 espBtn.MouseButton1Click:Connect(function()
     _G.ESP_Enabled = not _G.ESP_Enabled
-    espBtn.Text = _G.ESP_Enabled and "ESP (Red): ON" or "ESP (Red): OFF"
+    espBtn.Text = _G.ESP_Enabled and "ESP : ON" or "ESP : OFF"
     espBtn.BackgroundColor3 = _G.ESP_Enabled and Color3.fromRGB(60, 200, 60) or Color3.fromRGB(200, 60, 60)
     if not _G.ESP_Enabled then hardClearESP() end
 end)
@@ -115,7 +115,7 @@ selectPlayerBtn.MouseButton1Click:Connect(function()
     if #others > 0 then
         if playerIndex > #others then playerIndex = 1 end
         targetPlayer = others[playerIndex]
-        selectPlayerBtn.Text = "Target: " .. (targetPlayer.DisplayName or targetPlayer.Name)
+        selectPlayerBtn.Text = "Player: " .. (targetPlayer.DisplayName or targetPlayer.Name)
         playerIndex = playerIndex + 1
     end
 end)
@@ -123,13 +123,13 @@ end)
 followBtn.MouseButton1Click:Connect(function()
     if not targetPlayer then return end
     _G.FollowEnabled = not _G.FollowEnabled
-    followBtn.Text = _G.FollowEnabled and "Follow Flight: ON" or "Follow Flight: OFF"
+    followBtn.Text = _G.FollowEnabled and "Follow Player: ON" or "Follow Player: OFF"
     followBtn.BackgroundColor3 = _G.FollowEnabled and Color3.fromRGB(60, 200, 60) or Color3.fromRGB(200, 60, 60)
 end)
 
 autoCreditBtn.MouseButton1Click:Connect(function()
     _G.AutoFarm = not _G.AutoFarm
-    autoCreditBtn.Text = _G.AutoFarm and "Auto Farm Credit: ON" or "Auto Farm Credit: OFF"
+    autoCreditBtn.Text = _G.AutoFarm and "Auto Credit: ON" or "Auto Credit: OFF"
     autoCreditBtn.BackgroundColor3 = _G.AutoFarm and Color3.fromRGB(60, 200, 60) or Color3.fromRGB(200, 60, 60)
 end)
 
@@ -202,7 +202,7 @@ RunService.RenderStepped:Connect(function()
 
     -- Follow Flight
     if _G.FollowEnabled and targetPlayer and targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart") then
-        LocalPlayer.Character.HumanoidRootPart.CFrame = targetPlayer.Character.HumanoidRootPart.CFrame * CFrame.new(0, 5, 2)
+        LocalPlayer.Character.HumanoidRootPart.CFrame = targetPlayer.Character.HumanoidRootPart.CFrame * CFrame.new(0, 5, 5)
         LocalPlayer.Character.HumanoidRootPart.Velocity = Vector3.new(0,0,0)
     end
 end)
@@ -210,7 +210,7 @@ end)
 -- Auto Farm
 task.spawn(function()
     while running do
-        task.wait(0.5)
+        task.wait(0.3)
         if _G.AutoFarm and LocalPlayer.Character then
             local gameObjects = workspace:FindFirstChild("GameObjects") or workspace
             for _, obj in pairs(gameObjects:GetDescendants()) do
