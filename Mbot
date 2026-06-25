@@ -1,0 +1,664 @@
+require('dotenv').config();
+const {
+    Client, GatewayIntentBits, EmbedBuilder,
+    REST, Routes, SlashCommandBuilder,
+    ActionRowBuilder, ButtonBuilder, ButtonStyle,
+    ComponentType, MessageFlags
+} = require('discord.js');
+const {
+    joinVoiceChannel, createAudioPlayer, createAudioResource,
+    AudioPlayerStatus, getVoiceConnection, VoiceConnectionStatus,
+    StreamType, NoSubscriberBehavior
+} = require('@discordjs/voice');
+const { spawn } = require('child_process');
+
+// ─── ดึงเพลงที่เกี่ยวข้องจาก YouTube สำหรับ autoplay ────────────────────────
+
+function ytGetRelated(url, history = new Set()) {
+    return new Promise((resolve, reject) => {
+        let videoId = null;
+        try {
+            const parsed = new URL(url);
+            videoId = parsed.searchParams.get('v') || parsed.pathname.split('/').pop();
+        } catch {
+            return reject(new Error('URL ไม่ถูกต้อง'));
+        }
+
+        if (!videoId) return reject(new Error('ไม่พบ video ID'));
+
+        let data = '';
+        const proc = spawn('yt-dlp', [
+            '--dump-json',
+            '--quiet',
+            '--no-warnings',
+            '--flat-playlist',
+            '--playlist-items', '2-10',
+            `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`
+        ]);
+
+        proc.stdout.on('data', chunk => data += chunk);
+        proc.stderr.on('data', () => {});
+        proc.on('error', reject);
+
+        proc.on('close', () => {
+            const lines = data.trim().split('\n').filter(Boolean);
+            if (!lines.length) return reject(new Error('ไม่พบเพลงที่เกี่ยวข้อง'));
+
+            const candidates = [];
+            for (const line of lines) {
+                try {
+                    const item = JSON.parse(line);
+                    const itemUrl = item.url || `https://www.youtube.com/watch?v=${item.id}`;
+                    const itemId = item.id || new URL(itemUrl).searchParams.get('v');
+                    if (itemId && !history.has(itemId)) {
+                        candidates.push({
+                            id: itemId,
+                            title: item.title || 'Unknown',
+                            url: itemUrl,
+                            duration: formatSeconds(item.duration || 0),
+                            thumbnail: item.thumbnails?.[0]?.url || null,
+                            uploader: item.uploader || item.channel || 'Unknown'
+                        });
+                    }
+                } catch { /* skip parse error */ }
+            }
+
+            if (!candidates.length) return reject(new Error('ไม่มีเพลงใหม่ที่ยังไม่เคยเล่น'));
+            const pick = candidates[Math.floor(Math.random() * candidates.length)];
+            resolve(pick);
+        });
+    });
+}
+
+// ─── ค้นหาเพลง ───────────────────────────────────────────────────────────────
+
+function ytSearch(query) {
+    return new Promise((resolve, reject) => {
+        const isUrl = /^https?:\/\//.test(query);
+        const target = isUrl ? query : `ytsearch1:${query}`;
+
+        let data = '';
+        const proc = spawn('yt-dlp', [
+            '--dump-json',
+            '--no-playlist',
+            '--quiet',
+            '--no-warnings',
+            target
+        ]);
+
+        proc.stdout.on('data', chunk => data += chunk);
+        proc.stderr.on('data', () => {});
+        proc.on('error', reject);
+
+        proc.on('close', code => {
+            if (code !== 0 || !data.trim()) return reject(new Error('yt-dlp ไม่พบผลลัพธ์'));
+            try {
+                const info = JSON.parse(data.trim().split('\n')[0]);
+                resolve({
+                    title: info.title || 'Unknown',
+                    url: info.webpage_url || info.url,
+                    duration: formatSeconds(info.duration || 0),
+                    thumbnail: info.thumbnail || null,
+                    uploader: info.uploader || 'Unknown'
+                });
+            } catch {
+                reject(new Error('parse ข้อมูลเพลงล้มเหลว'));
+            }
+        });
+    });
+}
+
+// ─── สร้าง stream ผ่าน yt-dlp + ffmpeg (EPIPE safe) ─────────────────────────
+
+function createYtdlpStream(url) {
+    const proc = spawn('yt-dlp', [
+        '-f', 'bestaudio[ext=webm]/bestaudio/best',
+        '--no-playlist',
+        '--quiet',
+        '--no-warnings',
+        '-o', '-',
+        url
+    ]);
+
+    const ffmpeg = spawn('ffmpeg', [
+        '-i', 'pipe:0',
+        '-f', 's16le',
+        '-ar', '48000',
+        '-ac', '2',
+        '-loglevel', 'quiet',
+        'pipe:1'
+    ]);
+
+    proc.stdout.on('error', () => {});
+    proc.stderr.on('data', () => {});
+    proc.on('error', () => {});
+
+    ffmpeg.stdin.on('error', () => {});
+    ffmpeg.stderr.on('data', () => {});
+    ffmpeg.stdout.on('error', () => {});
+    ffmpeg.on('error', () => {});
+
+    proc.stdout.pipe(ffmpeg.stdin);
+
+    const cleanup = () => {
+        try { proc.kill('SIGKILL'); } catch { /* already dead */ }
+        try { ffmpeg.kill('SIGKILL'); } catch { /* already dead */ }
+    };
+
+    ffmpeg.stdout.on('end', cleanup);
+    proc.on('close', () => {
+        try { ffmpeg.stdin.end(); } catch { /* ignore */ }
+    });
+
+    return { stream: ffmpeg.stdout, type: StreamType.Raw, cleanup };
+}
+
+// ─── Utility ─────────────────────────────────────────────────────────────────
+
+function formatSeconds(sec) {
+    if (!sec || isNaN(sec)) return '?:??';
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = Math.floor(sec % 60);
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function chunkArray(arr, size) {
+    const chunks = [];
+    for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+    return chunks;
+}
+
+function extractVideoId(url) {
+    try {
+        const parsed = new URL(url);
+        return parsed.searchParams.get('v') || parsed.pathname.split('/').pop() || null;
+    } catch { return null; }
+}
+
+// ─── Queue State ──────────────────────────────────────────────────────────────
+
+/**
+ * @typedef {Object} ServerQueue
+ * @property {import('discord.js').TextChannel} textChannel
+ * @property {import('discord.js').VoiceChannel} voiceChannel
+ * @property {import('@discordjs/voice').VoiceConnection} connection
+ * @property {import('@discordjs/voice').AudioPlayer} player
+ * @property {Array<{title:string, url:string, duration:string, thumbnail:string|null, uploader:string}>} songs
+ * @property {number} volume  0–100
+ * @property {boolean} paused
+ * @property {boolean} autoplay
+ * @property {Set<string>} history  video ID ที่เคยเล่นแล้ว (ป้องกันซ้ำ)
+ * @property {Function|null} currentCleanup
+ */
+
+/** @type {Map<string, ServerQueue>} */
+const queue = new Map();
+
+// ─── Slash Commands ───────────────────────────────────────────────────────────
+
+const commands = [
+    new SlashCommandBuilder()
+        .setName('play')
+        .setDescription('เล่นเพลงจาก YouTube (ชื่อเพลงหรือลิงก์)')
+        .addStringOption(o =>
+            o.setName('query').setDescription('ชื่อเพลงหรือ URL').setRequired(true)
+        ),
+    new SlashCommandBuilder()
+        .setName('skip')
+        .setDescription('ข้ามเพลงปัจจุบัน'),
+    new SlashCommandBuilder()
+        .setName('stop')
+        .setDescription('หยุดเล่นและออกจากห้องเสียง'),
+    new SlashCommandBuilder()
+        .setName('queue')
+        .setDescription('ดูคิวเพลงปัจจุบัน')
+        .addIntegerOption(o =>
+            o.setName('page').setDescription('หน้า (default: 1)').setMinValue(1)
+        ),
+    new SlashCommandBuilder()
+        .setName('volume')
+        .setDescription('ปรับระดับเสียง (0–100)')
+        .addIntegerOption(o =>
+            o.setName('level').setDescription('0–100').setRequired(true).setMinValue(0).setMaxValue(100)
+        ),
+    new SlashCommandBuilder()
+        .setName('pause')
+        .setDescription('พักเพลงชั่วคราว'),
+    new SlashCommandBuilder()
+        .setName('resume')
+        .setDescription('เล่นเพลงต่อ'),
+    new SlashCommandBuilder()
+        .setName('nowplaying')
+        .setDescription('ดูเพลงที่กำลังเล่นอยู่'),
+    new SlashCommandBuilder()
+        .setName('autoplay')
+        .setDescription('เปิด/ปิด autoplay (เล่นเพลงต่อเนื่องอัตโนมัติ)'),
+].map(c => c.toJSON());
+
+// ─── Discord Client ───────────────────────────────────────────────────────────
+
+const client = new Client({
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
+});
+
+client.once('ready', async () => {
+    console.log(`✅ บอทออนไลน์: ${client.user.tag}`);
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+    try {
+        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+        console.log('✅ ลงทะเบียน Slash Commands สำเร็จ');
+    } catch (err) {
+        console.error('❌ ลงทะเบียน commands ล้มเหลว:', err);
+    }
+});
+
+// ─── Interaction Handler ──────────────────────────────────────────────────────
+
+client.on('interactionCreate', async interaction => {
+    if (!interaction.isChatInputCommand()) return;
+
+    const guildId = interaction.guildId;
+    const serverQueue = queue.get(guildId);
+    const { commandName } = interaction;
+
+    // ── /play ──────────────────────────────────────────────────────────────────
+    if (commandName === 'play') {
+        const voiceChannel = interaction.member.voice.channel;
+        if (!voiceChannel) {
+            return interaction.reply({ content: '❌ กรุณาเข้าห้องเสียงก่อนค่ะ', flags: MessageFlags.Ephemeral });
+        }
+
+        await interaction.deferReply();
+        const query = interaction.options.getString('query');
+
+        let song;
+        try {
+            song = await ytSearch(query);
+        } catch (err) {
+            console.error('ytSearch error:', err);
+            return interaction.editReply('❌ ไม่พบเพลงหรือลิงก์ไม่ถูกต้องค่ะ');
+        }
+
+        // มีคิวอยู่แล้ว → เพิ่มเพลงเข้าคิว
+        if (serverQueue) {
+            serverQueue.songs.push(song);
+            return interaction.editReply({
+                content: `📝 เพิ่ม **${song.title}** ลงคิวแล้ว (#${serverQueue.songs.length})`,
+            });
+        }
+
+        // ยังไม่มีคิว → สร้างใหม่และเริ่มเล่น
+        const player = createAudioPlayer({
+            behaviors: { noSubscriber: NoSubscriberBehavior.Pause }
+        });
+
+        const connection = joinVoiceChannel({
+            channelId: voiceChannel.id,
+            guildId,
+            adapterCreator: interaction.guild.voiceAdapterCreator,
+            selfDeaf: true
+        });
+
+        connection.subscribe(player);
+
+        // ── FIX 1: VoiceConnection error handler (ป้องกัน ECONNRESET crash) ──
+        connection.on('error', (err) => {
+            console.error('VoiceConnection error:', err.message);
+            const q = queue.get(guildId);
+            if (q) {
+                q.textChannel.send('⚠️ การเชื่อมต่อเสียงมีปัญหา กำลังหยุดเล่นค่ะ').catch(() => {});
+                cleanupQueue(guildId);
+            }
+        });
+
+        /** @type {ServerQueue} */
+        const newQueue = {
+            textChannel: interaction.channel,
+            voiceChannel,
+            connection,
+            player,
+            songs: [song],
+            volume: 50,
+            paused: false,
+            autoplay: false,
+            history: new Set(),
+            currentCleanup: null
+        };
+
+        queue.set(guildId, newQueue);
+
+        // disconnect handler — รอ 3 วิก่อน cleanup เผื่อ reconnect
+        connection.on(VoiceConnectionStatus.Disconnected, async () => {
+            await new Promise(r => setTimeout(r, 3000));
+            const q = queue.get(guildId);
+            if (q && q.connection.state.status === VoiceConnectionStatus.Disconnected) {
+                q.currentCleanup?.();
+                q.player.stop(true);
+                queue.delete(guildId);
+            }
+        });
+
+        await interaction.editReply(`⏳ กำลังโหลด: **${song.title}**`);
+        playSong(interaction.guild, newQueue);
+    }
+
+    // ── /skip ──────────────────────────────────────────────────────────────────
+    else if (commandName === 'skip') {
+        if (!memberInVoice(interaction)) return;
+        if (!serverQueue || serverQueue.songs.length === 0) {
+            return interaction.reply({ content: '❌ ไม่มีเพลงในคิวค่ะ', flags: MessageFlags.Ephemeral });
+        }
+        serverQueue.player.stop();
+        interaction.reply('️▹▹ ข้ามเพลงแล้วค่ะ');
+    }
+
+    // ── /stop ──────────────────────────────────────────────────────────────────
+    else if (commandName === 'stop') {
+        if (!memberInVoice(interaction)) return;
+        if (!serverQueue) {
+            return interaction.reply({ content: '❌ บอทไม่ได้เล่นเพลงอยู่ค่ะ', flags: MessageFlags.Ephemeral });
+        }
+        cleanupQueue(guildId);
+        interaction.reply('■ หยุดเล่นและออกจากห้องแล้วค่ะ');
+    }
+
+    // ── /pause ─────────────────────────────────────────────────────────────────
+    else if (commandName === 'pause') {
+        if (!memberInVoice(interaction)) return;
+        if (!serverQueue || serverQueue.paused) {
+            return interaction.reply({ content: '❌ ไม่มีเพลงที่เล่นอยู่ค่ะ', flags: MessageFlags.Ephemeral });
+        }
+        serverQueue.player.pause();
+        serverQueue.paused = true;
+        interaction.reply('ⅠⅠ พักเพลงชั่วคราวค่ะ');
+    }
+
+    // ── /resume ────────────────────────────────────────────────────────────────
+    else if (commandName === 'resume') {
+        if (!memberInVoice(interaction)) return;
+        if (!serverQueue || !serverQueue.paused) {
+            return interaction.reply({ content: '❌ เพลงไม่ได้ถูกพักอยู่ค่ะ', flags: MessageFlags.Ephemeral });
+        }
+        serverQueue.player.unpause();
+        serverQueue.paused = false;
+        interaction.reply('▶ เล่นเพลงต่อแล้วค่ะ');
+    }
+
+    // ── /volume ────────────────────────────────────────────────────────────────
+    else if (commandName === 'volume') {
+        if (!memberInVoice(interaction)) return;
+        if (!serverQueue) {
+            return interaction.reply({ content: '❌ ไม่มีเพลงที่เล่นอยู่ค่ะ', flags: MessageFlags.Ephemeral });
+        }
+        const level = interaction.options.getInteger('level');
+        serverQueue.volume = level;
+        interaction.reply(`🔊 ตั้งระดับเสียงเป็น **${level}%** แล้วค่ะ (มีผลกับเพลงถัดไปค่ะ)`);
+    }
+
+    // ── /queue ─────────────────────────────────────────────────────────────────
+    else if (commandName === 'queue') {
+        if (!serverQueue || serverQueue.songs.length === 0) {
+            return interaction.reply({ content: '❌ คิวว่างอยู่ค่ะ', flags: MessageFlags.Ephemeral });
+        }
+
+        const page = (interaction.options.getInteger('page') || 1) - 1;
+        const ITEMS_PER_PAGE = 10;
+        const pages = chunkArray(serverQueue.songs, ITEMS_PER_PAGE);
+
+        if (page >= pages.length) {
+            return interaction.reply({ content: `❌ ไม่มีหน้า ${page + 1} ค่ะ`, flags: MessageFlags.Ephemeral });
+        }
+
+        const description = pages[page].map((s, i) => {
+            const idx = page * ITEMS_PER_PAGE + i;
+            const label = idx === 0 ? '▶ **กำลังเล่น**' : `\`${idx}.\``;
+            return `${label} [${s.title}](${s.url}) — \`${s.duration}\``;
+        }).join('\n');
+
+        const embed = new EmbedBuilder()
+            .setColor('#ffaa00')
+            .setTitle('📑 คิวเพลง')
+            .setDescription(description)
+            .setFooter({ text: `หน้า ${page + 1}/${pages.length} • รวม ${serverQueue.songs.length} เพลง` });
+
+        interaction.reply({ embeds: [embed] });
+    }
+
+    // ── /autoplay ──────────────────────────────────────────────────────────────
+    else if (commandName === 'autoplay') {
+        if (!serverQueue) {
+            return interaction.reply({ content: '❌ ไม่มีเพลงที่เล่นอยู่ค่ะ', flags: MessageFlags.Ephemeral });
+        }
+        serverQueue.autoplay = !serverQueue.autoplay;
+        interaction.reply(
+            serverQueue.autoplay
+                ? '⇄ เปิด Autoplay แล้วค่ะ — บอทจะเล่นเพลงต่อเนื่องอัตโนมัติ'
+                : '️■ ปิด Autoplay แล้วค่ะ'
+        );
+    }
+
+    // ── /nowplaying ────────────────────────────────────────────────────────────
+    else if (commandName === 'nowplaying') {
+        if (!serverQueue || serverQueue.songs.length === 0) {
+            return interaction.reply({ content: '❌ ไม่มีเพลงที่เล่นอยู่ค่ะ', flags: MessageFlags.Ephemeral });
+        }
+        const song = serverQueue.songs[0];
+        const embed = buildNowPlayingEmbed(song, serverQueue);
+        interaction.reply({ embeds: [embed] });
+    }
+});
+
+// ─── Core: Play Song ──────────────────────────────────────────────────────────
+
+async function playSong(guild, serverQueue) {
+    if (!serverQueue || serverQueue.songs.length === 0) {
+        cleanupQueue(guild.id);
+        return;
+    }
+
+    const song = serverQueue.songs[0];
+
+    let streamData;
+    try {
+        streamData = createYtdlpStream(song.url);
+    } catch (err) {
+        console.error('Stream error:', err);
+        await serverQueue.textChannel.send(`❌ โหลดเพลง **${song.title}** ไม่ได้ค่ะ กำลังข้ามไปเพลงถัดไป...`);
+        serverQueue.songs.shift();
+        return playSong(guild, serverQueue);
+    }
+
+    serverQueue.currentCleanup = streamData.cleanup;
+
+    const resource = createAudioResource(streamData.stream, {
+        inputType: streamData.type,
+        inlineVolume: true
+    });
+    resource.volume?.setVolume(serverQueue.volume / 100);
+
+    serverQueue.player.play(resource);
+    serverQueue.paused = false;
+
+    // ── Now Playing embed + ปุ่มควบคุม ────────────────────────────────────────
+    const embed = buildNowPlayingEmbed(song, serverQueue);
+    const row1 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('btn_pause').setLabel('ⅠⅠ พัก').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('btn_skip').setLabel('⏭ ข้าม').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('btn_stop').setLabel('■ ออก').setStyle(ButtonStyle.Danger),
+    );
+    const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('btn_vol_down').setLabel('🔉 -10%').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('btn_vol_up').setLabel('🔊 +10%').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+            .setCustomId('btn_autoplay')
+            .setLabel(serverQueue.autoplay ? '⇄ Auto: เปิด' : '️⇄ Auto: ปิด')
+            .setStyle(serverQueue.autoplay ? ButtonStyle.Success : ButtonStyle.Secondary),
+    );
+
+    let playingMsg;
+    try {
+        playingMsg = await serverQueue.textChannel.send({ embeds: [embed], components: [row1, row2] });
+    } catch (err) {
+        console.error('ส่ง message ไม่ได้:', err);
+    }
+
+    // Button collector — หมดอายุ 10 นาที หรือเมื่อเพลงจบ
+    const collector = playingMsg?.createMessageComponentCollector({
+        componentType: ComponentType.Button,
+        time: 10 * 60 * 1000
+    });
+
+    // ── FIX 2: deferReply ก่อนเสมอ ป้องกัน Unknown interaction (10062) ───────
+    collector?.on('collect', async btnInt => {
+        try {
+            await btnInt.deferReply({ ephemeral: true });
+        } catch {
+            return; // interaction หมดอายุแล้ว ข้ามไป
+        }
+
+        const q = queue.get(guild.id);
+        if (!q) {
+            return btnInt.followUp({ content: '❌ ไม่มีคิวแล้วค่ะ', ephemeral: true });
+        }
+
+        if (btnInt.member.voice.channelId !== q.voiceChannel.id) {
+            return btnInt.followUp({ content: '❌ กรุณาอยู่ในห้องเสียงเดียวกับบอทค่ะ', ephemeral: true });
+        }
+
+        if (btnInt.customId === 'btn_pause') {
+            if (q.paused) {
+                q.player.unpause(); q.paused = false;
+                await btnInt.followUp({ content: '▶ เล่นต่อแล้วค่ะ', ephemeral: true });
+            } else {
+                q.player.pause(); q.paused = true;
+                await btnInt.followUp({ content: 'ⅠⅠ พักเพลงไว้แล้วค่ะ', ephemeral: true });
+            }
+        } else if (btnInt.customId === 'btn_skip') {
+            q.player.stop();
+            await btnInt.followUp({ content: '⏭ ข้ามเพลงแล้วค่ะ', ephemeral: true });
+        } else if (btnInt.customId === 'btn_stop') {
+            cleanupQueue(guild.id);
+            await btnInt.followUp({ content: '■ หยุดเล่นและออกจากห้องแล้วค่ะ', ephemeral: true });
+        } else if (btnInt.customId === 'btn_vol_down') {
+            q.volume = Math.max(0, q.volume - 10);
+            await btnInt.followUp({ content: `🔉 ลดเสียงเหลือ **${q.volume}%** ค่ะ (มีผลเพลงถัดไป)`, ephemeral: true });
+        } else if (btnInt.customId === 'btn_vol_up') {
+            q.volume = Math.min(100, q.volume + 10);
+            await btnInt.followUp({ content: `🔊 เพิ่มเสียงเป็น **${q.volume}%** ค่ะ (มีผลเพลงถัดไป)`, ephemeral: true });
+        } else if (btnInt.customId === 'btn_autoplay') {
+            q.autoplay = !q.autoplay;
+            await btnInt.followUp({
+                content: q.autoplay ? '⇄ เปิด Autoplay แล้วค่ะ' : '■ ปิด Autoplay แล้วค่ะ',
+                ephemeral: true
+            });
+        }
+    });
+
+    // ── AudioPlayer listeners ─────────────────────────────────────────────────
+    const onIdle = async () => {
+        collector?.stop();
+        streamData.cleanup?.();
+        serverQueue.currentCleanup = null;
+        disableButtons(playingMsg);
+
+        const finishedSong = serverQueue.songs.shift();
+        const q = queue.get(guild.id);
+        if (!q) return;
+
+        // บันทึก video ID ลง history
+        const finishedId = finishedSong?.url ? extractVideoId(finishedSong.url) : null;
+        if (finishedId) q.history.add(finishedId);
+
+        // autoplay: คิวว่าง + เปิด autoplay → ดึงเพลงใหม่ที่ไม่ซ้ำ
+        if (q.songs.length === 0 && q.autoplay && finishedSong?.url) {
+            try {
+                const related = await ytGetRelated(finishedSong.url, q.history);
+                const relatedId = extractVideoId(related.url);
+                if (relatedId) q.history.add(relatedId);
+                q.songs.push(related);
+                q.textChannel.send(`⇄ **Autoplay** → **${related.title}**`).catch(() => {});
+            } catch (err) {
+                console.error('Autoplay error:', err);
+                q.textChannel.send('⇄ Autoplay ไม่พบเพลงใหม่ที่ยังไม่เคยเล่น หยุดเล่นค่ะ').catch(() => {});
+                cleanupQueue(guild.id);
+                return;
+            }
+        }
+
+        playSong(guild, q);
+    };
+
+    const onError = (err) => {
+        console.error('Player error:', err);
+        collector?.stop();
+        streamData.cleanup?.();
+        serverQueue.currentCleanup = null;
+        disableButtons(playingMsg);
+
+        serverQueue.textChannel.send(`❌ เกิดข้อผิดพลาดกับเพลง **${song.title}** กำลังข้ามค่ะ`).catch(() => {});
+        const errSong = serverQueue.songs.shift();
+        const errId = errSong?.url ? extractVideoId(errSong.url) : null;
+        if (errId) serverQueue.history.add(errId);
+
+        const q = queue.get(guild.id);
+        if (q) playSong(guild, q);
+    };
+
+    // ลบ listener เก่าก่อนเสมอ ป้องกัน duplicate
+    serverQueue.player.removeAllListeners(AudioPlayerStatus.Idle);
+    serverQueue.player.removeAllListeners('error');
+    serverQueue.player.once(AudioPlayerStatus.Idle, onIdle);
+    serverQueue.player.once('error', onError);
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function buildNowPlayingEmbed(song, serverQueue) {
+    const embed = new EmbedBuilder()
+        .setColor('#00ff88')
+        .setAuthor({ name: '♫  กำลังเล่นอยู่ตอนนี้' })
+        .setTitle(song.title)
+        .setURL(song.url)
+        .addFields(
+            { name: '⏱ ความยาว', value: song.duration, inline: true },
+            { name: '🎤 ช่อง', value: song.uploader, inline: true },
+            { name: '🔊 ระดับเสียง', value: `${serverQueue.volume}%`, inline: true },
+            { name: '📑 เพลงในคิว', value: `${serverQueue.songs.length} เพลง`, inline: true }
+        );
+    if (song.thumbnail) embed.setThumbnail(song.thumbnail);
+    return embed;
+}
+
+function cleanupQueue(guildId) {
+    const q = queue.get(guildId);
+    if (!q) return;
+
+    q.currentCleanup?.();
+    q.songs = [];
+    q.player.stop(true);
+    q.player.removeAllListeners();
+
+    const conn = getVoiceConnection(guildId);
+    conn?.destroy();
+
+    queue.delete(guildId);
+}
+
+async function disableButtons(msg) {
+    if (!msg) return;
+    try { await msg.edit({ components: [] }); } catch { /* message อาจถูกลบแล้ว */ }
+}
+
+function memberInVoice(interaction) {
+    if (!interaction.member.voice.channel) {
+        interaction.reply({ content: '❌ กรุณาเข้าห้องเสียงก่อนค่ะ', flags: MessageFlags.Ephemeral });
+        return false;
+    }
+    return true;
+}
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+
+client.login(process.env.DISCORD_TOKEN);
